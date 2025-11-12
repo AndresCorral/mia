@@ -267,6 +267,7 @@ async def send_to_webhook(
     message_text: str,
     user_id: str,
     username: str,
+    message: discord.Message,
     attachments: Optional[List[Dict[str, Any]]] = None
 ) -> Dict[str, Any]:
     """
@@ -276,6 +277,7 @@ async def send_to_webhook(
         message_text: El texto del mensaje a enviar
         user_id: ID del usuario de Discord
         username: Nombre del usuario de Discord
+        message: Objeto completo del mensaje de Discord
         attachments: Lista de adjuntos con información de archivos
     
     Returns:
@@ -285,11 +287,59 @@ async def send_to_webhook(
         logger.error("Sesión HTTP no inicializada")
         return {"error": "Sesión HTTP no disponible"}
     
+    # Construir metadata completa de Discord
+    metadata = {
+        # Información del mensaje
+        "message_id": str(message.id),
+        "created_at": message.created_at.isoformat(),
+        "edited_at": message.edited_at.isoformat() if message.edited_at else None,
+        
+        # Información del usuario
+        "user": {
+            "id": str(message.author.id),
+            "username": message.author.name,
+            "discriminator": message.author.discriminator,
+            "display_name": message.author.display_name,
+            "bot": message.author.bot,
+            "avatar_url": str(message.author.avatar.url) if message.author.avatar else None,
+        },
+        
+        # Información del canal
+        "channel": {
+            "id": str(message.channel.id),
+            "type": str(message.channel.type),
+            "name": getattr(message.channel, 'name', None),
+        },
+        
+        # Información del servidor (si no es DM)
+        "guild": None,
+        
+        # IDs de sesión/conversación
+        "conversation_id": str(message.channel.id),  # El channel_id sirve como conversation_id
+        "thread_id": str(message.channel.id),  # Para mantener conversaciones
+    }
+    
+    # Agregar información del servidor si no es DM
+    if message.guild:
+        metadata["guild"] = {
+            "id": str(message.guild.id),
+            "name": message.guild.name,
+            "icon_url": str(message.guild.icon.url) if message.guild.icon else None,
+        }
+        
+        # Si el usuario es miembro del servidor, agregar info adicional
+        if isinstance(message.author, discord.Member):
+            metadata["user"]["roles"] = [str(role.id) for role in message.author.roles]
+            metadata["user"]["joined_at"] = message.author.joined_at.isoformat() if message.author.joined_at else None
+            metadata["user"]["nickname"] = message.author.nick
+    
+    # Construir payload
     payload = {
         "message": message_text,
         "user_id": user_id,
         "username": username,
-        "platform": "discord"
+        "platform": "discord",
+        "metadata": metadata,
     }
     
     if attachments:
@@ -468,11 +518,12 @@ async def process_message(message: discord.Message) -> None:
     
     # Mostrar indicador de escritura mientras espera respuesta
     async with message.channel.typing():
-        # Enviar al webhook
+        # Enviar al webhook con el objeto message completo
         response_data = await send_to_webhook(
             user_message,
             str(message.author.id),
             message.author.name,
+            message,  # ← Pasar el objeto message completo
             attachments_info if attachments_info else None
         )
     
@@ -529,7 +580,7 @@ async def on_message(message: discord.Message) -> None:
     
     SOLO responde en:
     1. Mensajes directos (DM) - SIEMPRE
-    2. Menciones en canales - SOLO cuando lo mencionen
+    2. Menciones DIRECTAS al bot en canales - SOLO @Mia (NO @everyone, NO @here)
     
     Args:
         message: Mensaje recibido
@@ -544,11 +595,13 @@ async def on_message(message: discord.Message) -> None:
         await process_message(message)
         return
     
-    # Procesar menciones en canales - SOLO cuando lo mencionen
-    if bot.user and bot.user.mentioned_in(message):
-        logger.info(f"🏷️ Mención en canal de {message.author.name}")
-        await process_message(message)
-        return
+    # Procesar menciones DIRECTAS en canales (NO @everyone, NO @here)
+    if bot.user and bot.user in message.mentions:
+        # Verificar que no sea solo @everyone o @here
+        if not message.mention_everyone:
+            logger.info(f"🏷️ Mención directa en canal de {message.author.name}")
+            await process_message(message)
+            return
     
     # Para cualquier otro mensaje en canales, procesar comandos pero NO responder
     await bot.process_commands(message)
